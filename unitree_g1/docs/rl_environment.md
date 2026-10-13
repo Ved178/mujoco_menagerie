@@ -220,3 +220,64 @@ numerically invalid.
 Later steps should collect rollouts, connect an external PPO trainer, add domain
 randomization, and evaluate deterministic policies. Those are intentionally not
 implemented here.
+
+## Rollout Collection
+
+Step 4 rollout collection is implemented in `rollout_collector.py`. It uses the
+environment's Gymnasium-style API:
+
+```text
+observation, info = env.reset(seed=...)
+next_observation, reward, terminated, truncated, info = env.step(action)
+```
+
+The built-in `RandomPolicy` samples direct joint-position targets uniformly
+within `env.action_space.low` and `env.action_space.high`. For G1 these actions
+are radians and are submitted directly to the environment; the environment still
+performs its own clipping before writing MuJoCo controls.
+
+For `N` transitions, a `RolloutBatch` stores:
+
+```text
+observations         (N, obs_dim)
+actions              (N, action_dim)
+rewards              (N,)
+next_observations    (N, obs_dim)
+terminated           (N,)
+truncated            (N,)
+episode_ids          (N,)
+timesteps            (N,)
+commanded_velocities (N, 3)
+actuator_forces      (N, action_dim)
+controls             (N, action_dim)
+reward_components    (N, num_reward_components)
+termination_reasons  (N,)
+```
+
+Terminal and truncated transitions keep their final `next_observation`; the next
+episode's reset observation is not substituted into that transition. Rollout
+files are saved as compressed `.npz` archives with JSON metadata and can be
+loaded with `load_rollout_batch()`.
+
+To collect a headless random rollout:
+
+```text
+./env/bin/python demo_collect_rollout.py --transitions 100 --seed 7
+```
+
+To render on macOS, use MuJoCo's launcher:
+
+```text
+mjpython demo_collect_rollout.py --transitions 100 --render
+```
+
+An existing compatible policy can be supplied to `collect_rollout()` as any
+callable with the signature:
+
+```text
+action = policy(observation)
+```
+
+The callable must return one finite action vector matching the environment's
+actual action dimension. No checkpoint format or neural-network policy is
+introduced in Step 4.

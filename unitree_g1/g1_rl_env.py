@@ -104,6 +104,46 @@ class RewardConfig:
       raise ValueError('torque_penalty_weight must be >= 0')
 
 
+@dataclass(frozen=True)
+class FrictionRandomizationConfig:
+  enabled: bool = False
+  sliding_range: tuple[float, float] = (0.7, 1.3)
+
+
+@dataclass(frozen=True)
+class MassRandomizationConfig:
+  enabled: bool = False
+  scale_range: tuple[float, float] = (0.9, 1.1)
+
+
+@dataclass(frozen=True)
+class MotorStrengthRandomizationConfig:
+  enabled: bool = False
+  scale_range: tuple[float, float] = (0.8, 1.2)
+
+
+@dataclass(frozen=True)
+class PushRandomizationConfig:
+  enabled: bool = False
+  magnitude_range: tuple[float, float] = (20.0, 80.0)
+  duration_steps: int = 5
+  interval_range_steps: tuple[int, int] = (100, 250)
+  body_name: str = 'pelvis'
+
+
+@dataclass(frozen=True)
+class DomainRandomizationConfig:
+  """Per-reset domain randomization, disabled by default."""
+
+  enabled: bool = False
+  friction: FrictionRandomizationConfig = FrictionRandomizationConfig()
+  mass: MassRandomizationConfig = MassRandomizationConfig()
+  motor_strength: MotorStrengthRandomizationConfig = (
+    MotorStrengthRandomizationConfig()
+  )
+  pushes: PushRandomizationConfig = PushRandomizationConfig()
+
+
 class G1VelocityTrackingEnv:
   """MuJoCo-backed G1 velocity-tracking environment skeleton.
 
@@ -131,6 +171,7 @@ class G1VelocityTrackingEnv:
     fall_height: float = 0.45,
     min_base_up_z: float = 0.35,
     reward_config: RewardConfig | None = None,
+    domain_randomization: DomainRandomizationConfig | None = None,
     seed: int | None = None,
   ) -> None:
     if model_path is None:
@@ -149,7 +190,16 @@ class G1VelocityTrackingEnv:
     self.reward_config = (
       RewardConfig() if reward_config is None else reward_config
     )
+    self.domain_randomization = (
+      DomainRandomizationConfig()
+      if domain_randomization is None
+      else domain_randomization
+    )
     self.elapsed_steps = 0
+    self._physics_step_count = 0
+    self._push_steps_remaining = 0
+    self._next_push_step: int | None = None
+    self._current_push_force = np.zeros(3)
 
     self._validate_model()
     self._joint_ids = np.array(
@@ -191,6 +241,26 @@ class G1VelocityTrackingEnv:
     self.default_qpos = self.model.key_qpos[self._stand_key_id].copy()
     self.default_ctrl = self.model.key_ctrl[self._stand_key_id].copy()
     self.default_joint_positions = self.default_qpos[self._qpos_addr].copy()
+    self._floor_geom_id = mujoco.mj_name2id(
+      self.model, mujoco.mjtObj.mjOBJ_GEOM, 'floor'
+    )
+    if self._floor_geom_id < 0:
+      raise ValueError('Model does not contain required geom "floor"')
+    self._push_body_id = mujoco.mj_name2id(
+      self.model,
+      mujoco.mjtObj.mjOBJ_BODY,
+      self.domain_randomization.pushes.body_name,
+    )
+    if self._push_body_id < 0:
+      raise ValueError(
+        'Model does not contain configured push body '
+        f'{self.domain_randomization.pushes.body_name!r}'
+      )
+    self._nominal_geom_friction = self.model.geom_friction.copy()
+    self._nominal_body_mass = self.model.body_mass.copy()
+    self._nominal_actuator_gainprm = self.model.actuator_gainprm.copy()
+    self._nominal_actuator_biasprm = self.model.actuator_biasprm.copy()
+    self.last_randomization: dict[str, Any] = {}
 
     self.action_low = self.model.actuator_ctrlrange[:, 0].copy()
     self.action_high = self.model.actuator_ctrlrange[:, 1].copy()
@@ -227,10 +297,16 @@ class G1VelocityTrackingEnv:
     if 'commanded_velocity' in options:
       self.commanded_velocity = self._as_command(options['commanded_velocity'])
 
+    self._apply_domain_randomization()
     mujoco.mj_resetDataKeyframe(self.model, self.data, self._stand_key_id)
     self.data.ctrl[:] = self.default_ctrl
+    self.data.xfrc_applied[:] = 0.0
     self.previous_action = self.default_ctrl.copy()
     self.elapsed_steps = 0
+    self._physics_step_count = 0
+    self._push_steps_remaining = 0
+    self._current_push_force[:] = 0.0
+    self._schedule_next_push()
     mujoco.mj_forward(self.model, self.data)
 
     obs = self._get_observation()
@@ -244,7 +320,9 @@ class G1VelocityTrackingEnv:
     self.data.ctrl[:] = clipped_action
 
     for _ in range(self.frame_skip):
+      self._update_push_disturbance()
       mujoco.mj_step(self.model, self.data)
+      self._physics_step_count += 1
 
     self.elapsed_steps += 1
     self.previous_action = clipped_action.copy()
@@ -400,9 +478,11 @@ class G1VelocityTrackingEnv:
       'base_angular_velocity': self.base_angular_velocity.copy(),
       'joint_positions': self.joint_positions.copy(),
       'joint_velocities': self.joint_velocities.copy(),
+      'actuator_force': self.data.actuator_force.copy(),
       'ctrl': self.data.ctrl.copy(),
       'previous_action': self.previous_action.copy(),
       'elapsed_steps': self.elapsed_steps,
+      'domain_randomization': self.last_randomization.copy(),
     }
 
   def _is_terminated(self) -> bool:
@@ -422,6 +502,102 @@ class G1VelocityTrackingEnv:
     if not np.all(np.isfinite(command)):
       raise ValueError('commanded_velocity contains NaN or infinite values')
     return command
+
+  def _apply_domain_randomization(self) -> None:
+    self._restore_nominal_model()
+    config = self.domain_randomization
+    applied: dict[str, Any] = {'enabled': config.enabled}
+    if not config.enabled:
+      self.last_randomization = applied
+      return
+
+    if config.friction.enabled:
+      scale = self._uniform_range(config.friction.sliding_range)
+      self.model.geom_friction[self._floor_geom_id, 0] = (
+        self._nominal_geom_friction[self._floor_geom_id, 0] * scale
+      )
+      applied['friction_scale'] = scale
+      applied['floor_sliding_friction'] = float(
+        self.model.geom_friction[self._floor_geom_id, 0]
+      )
+
+    if config.mass.enabled:
+      scale = self._uniform_range(config.mass.scale_range)
+      body_mask = self._nominal_body_mass > 0.0
+      self.model.body_mass[body_mask] = (
+        self._nominal_body_mass[body_mask] * scale
+      )
+      applied['mass_scale'] = scale
+
+    if config.motor_strength.enabled:
+      scale = self._uniform_range(config.motor_strength.scale_range)
+      # Position actuators in this model use gainprm[0] for kp and biasprm
+      # entries for the matching spring/damping terms. Scaling these changes
+      # the actual actuator output force for a given position error.
+      self.model.actuator_gainprm[:, 0] = (
+        self._nominal_actuator_gainprm[:, 0] * scale
+      )
+      self.model.actuator_biasprm[:, 1] = (
+        self._nominal_actuator_biasprm[:, 1] * scale
+      )
+      self.model.actuator_biasprm[:, 2] = (
+        self._nominal_actuator_biasprm[:, 2] * scale
+      )
+      applied['motor_strength_scale'] = scale
+
+    if hasattr(mujoco, 'mj_setConst'):
+      mujoco.mj_setConst(self.model, self.data)
+    self.last_randomization = applied
+
+  def _restore_nominal_model(self) -> None:
+    self.model.geom_friction[:] = self._nominal_geom_friction
+    self.model.body_mass[:] = self._nominal_body_mass
+    self.model.actuator_gainprm[:] = self._nominal_actuator_gainprm
+    self.model.actuator_biasprm[:] = self._nominal_actuator_biasprm
+    if hasattr(mujoco, 'mj_setConst'):
+      mujoco.mj_setConst(self.model, self.data)
+
+  def _uniform_range(self, value_range: tuple[float, float]) -> float:
+    low, high = value_range
+    if not np.isfinite(low) or not np.isfinite(high) or low > high:
+      raise ValueError(f'invalid randomization range: {value_range}')
+    return float(self.rng.uniform(low, high))
+
+  def _schedule_next_push(self) -> None:
+    config = self.domain_randomization.pushes
+    if not self.domain_randomization.enabled or not config.enabled:
+      self._next_push_step = None
+      return
+    low, high = config.interval_range_steps
+    if low < 1 or high < low:
+      raise ValueError(
+        f'invalid push interval range: {config.interval_range_steps}'
+      )
+    self._next_push_step = int(
+      self._physics_step_count + self.rng.integers(low, high + 1)
+    )
+
+  def _update_push_disturbance(self) -> None:
+    self.data.xfrc_applied[:] = 0.0
+    config = self.domain_randomization.pushes
+    if not self.domain_randomization.enabled or not config.enabled:
+      return
+    if self._push_steps_remaining > 0:
+      self.data.xfrc_applied[self._push_body_id, :3] = self._current_push_force
+      self._push_steps_remaining -= 1
+      if self._push_steps_remaining == 0:
+        self._schedule_next_push()
+      return
+    if self._next_push_step is None or self._physics_step_count < self._next_push_step:
+      return
+    magnitude = self._uniform_range(config.magnitude_range)
+    angle = float(self.rng.uniform(-np.pi, np.pi))
+    self._current_push_force[:] = (
+      magnitude * np.array([np.cos(angle), np.sin(angle), 0.0])
+    )
+    self._push_steps_remaining = config.duration_steps
+    self.data.xfrc_applied[self._push_body_id, :3] = self._current_push_force
+    self._push_steps_remaining -= 1
 
   @property
   def joint_positions(self) -> np.ndarray:
